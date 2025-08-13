@@ -7,6 +7,8 @@ use std::sync::Arc;
 
 pub const F64_MAX_SAFE_INTEGER: f64 = (i64::pow(2, 53) - 1) as f64;
 pub const F64_MIN_SAFE_INTEGER: f64 = -F64_MAX_SAFE_INTEGER;
+pub const I32_MAX_SAFE_INTEGER: f64 = (i64::pow(2, 31) - 1) as f64;
+pub const I32_MIN_SAFE_INTEGER: f64 = -I32_MAX_SAFE_INTEGER;
 
 /// Any is an enum with a potentially associated value that is used to represent JSON values
 /// and supports efficient encoding of those values.
@@ -136,8 +138,8 @@ impl Any {
             Any::Number(num) => {
                 let num_truncated = num.trunc();
                 if num_truncated == *num
-                    && num_truncated <= F64_MAX_SAFE_INTEGER
-                    && num_truncated >= F64_MIN_SAFE_INTEGER
+                    && num_truncated <= I32_MAX_SAFE_INTEGER
+                    && num_truncated >= I32_MIN_SAFE_INTEGER
                 {
                     // TYPE 125: INTEGER
                     encoder.write_u8(125);
