@@ -276,8 +276,10 @@ TEST_CASE("YXmlElement basic") {
     Branch *xml = yxmlelem_insert_elem(frag, txn, 0, "div");
 
     // XML attributes API
-    yxmlelem_insert_attr(xml, txn, "key1", "value1");
-    yxmlelem_insert_attr(xml, txn, "key2", "value2");
+    YInput attr_value = yinput_string("value1");
+    yxmlelem_insert_attr(xml, txn, "key1", &attr_value);
+    attr_value = yinput_string("value2");
+    yxmlelem_insert_attr(xml, txn, "key2", &attr_value);
 
     YXmlAttrIter *i = yxmlelem_attr_iter(xml, txn);
     YXmlAttr *attr;
@@ -295,12 +297,12 @@ TEST_CASE("YXmlElement basic") {
         switch (attr->name[3]) {
             case '1': {
                 REQUIRE(!strcmp(attr->name, "key1"));
-                REQUIRE(!strcmp(attr->value, "value1"));
+                REQUIRE(!strcmp(youtput_read_string(attr->value), "value1"));
                 break;
             }
             case '2': {
                 REQUIRE(!strcmp(attr->name, "key2"));
-                REQUIRE(!strcmp(attr->value, "value2"));
+                REQUIRE(!strcmp(youtput_read_string(attr->value), "value2"));
                 break;
             }
             default: {
@@ -980,8 +982,10 @@ TEST_CASE("YXmlElement observe") {
     YSubscription *sub = yxmlelem_observe(xml, (void *) t, &yxml_test_observe);
 
     // insert initial attributes
-    yxmlelem_insert_attr(xml, txn, "attr1", "value1");
-    yxmlelem_insert_attr(xml, txn, "attr2", "value2");
+    YInput attr_value = yinput_string("value1");
+    yxmlelem_insert_attr(xml, txn, "attr1", &attr_value);
+    attr_value = yinput_string("value2");
+    yxmlelem_insert_attr(xml, txn, "attr2", &attr_value);
     ytransaction_commit(txn);
 
     REQUIRE(t->target != NULL);
@@ -1012,7 +1016,8 @@ TEST_CASE("YXmlElement observe") {
     // update attributes
     yxml_test_clean(t);
     txn = ydoc_write_transaction(doc, 0, NULL);
-    yxmlelem_insert_attr(xml, txn, "attr1", "value11");
+    attr_value = yinput_string("value11");
+    yxmlelem_insert_attr(xml, txn, "attr1", &attr_value);
     yxmlelem_remove_attr(xml, txn, "attr2");
     ytransaction_commit(txn);
 
@@ -1872,7 +1877,9 @@ TEST_CASE("Weak link references") {
     ytext_insert(txt, txn, 0, "hello world!", NULL);
 
     // create a text quotation and put it into map
-    YInput value = yinput_weak(ytext_quote(txt, txn, 2, 10, Y_FALSE, Y_FALSE));
+    uint32_t start = 2;
+    uint32_t end = 10;
+    YInput value = yinput_weak(ytext_quote(txt, txn, &start, &end, Y_FALSE, Y_FALSE));
     ymap_insert(map, txn, "text-txt_link", &value);
     Branch *txt_link = youtput_read_yweak(ymap_get(map, txn, "text-txt_link"));
 
@@ -1903,7 +1910,9 @@ TEST_CASE("Weak link references") {
         yinput_long(4),
     };
     yarray_insert_range(arr, txn, 0, items, 4);
-    value = yinput_weak(yarray_quote(arr, txn, 1, 3, Y_FALSE, Y_TRUE));
+    start = 1;
+    end = 3;
+    value = yinput_weak(yarray_quote(arr, txn, &start, &end, Y_FALSE, Y_TRUE));
     ymap_insert(map, txn, "array-txt_link", &value);
     Branch *array_link = youtput_read_yweak(ymap_get(map, txn, "array-txt_link"));
 

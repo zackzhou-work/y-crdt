@@ -55,24 +55,67 @@ pub trait ReadTxn: Sized {
         self.store().encode_state_from_snapshot(snapshot, encoder)
     }
 
-    /// Encodes the difference between remove peer state given its `state_vector` and the state
-    /// of a current local peer
+    /// Encodes the difference between remote peer state given its `state_vector` and the state
+    /// of a current local peer.
+    ///
+    /// # Differences between alternative methods
+    ///
+    /// - [Self::encode_state_as_update] encodes full document state including pending updates and
+    /// entire delete set.
+    /// - [Self::encode_diff] encodes only the difference between the current state and
+    /// the given state vector, including entire delete set. Pending updates are not included.
+    /// - [TransactionMut::encode_update] encodes only inserts and deletes made within the scope
+    /// of the current transaction.
     fn encode_diff<E: Encoder>(&self, state_vector: &StateVector, encoder: &mut E) {
         self.store().encode_diff(state_vector, encoder)
     }
 
+    /// Encodes the difference between remote peer state given its `state_vector` and the state
+    /// of a current local peer, using lib0 v1 encoding.
+    ///
+    /// # Differences between alternative methods
+    ///
+    /// - [Self::encode_state_as_update_v1] encodes full document state including pending updates
+    /// and entire delete set.
+    /// - [Self::encode_diff_v1] encodes only the difference between the current state and
+    /// the given state vector, including entire delete set. Pending updates are not included.
+    /// - [TransactionMut::encode_update_v1] encodes only inserts and deletes made within the scope
+    /// of the current transaction.
     fn encode_diff_v1(&self, state_vector: &StateVector) -> Vec<u8> {
         let mut encoder = EncoderV1::new();
         self.encode_diff(state_vector, &mut encoder);
         encoder.to_vec()
     }
 
+    /// Encodes the difference between remote peer state given its `state_vector` and the state
+    /// of a current local peer, using lib0 v2 encoding.
+    ///
+    /// # Differences between alternative methods
+    ///
+    /// - [Self::encode_state_as_update_v2] encodes full document state including pending updates
+    /// and entire delete set.
+    /// - [Self::encode_diff_v2] encodes only the difference between the current state and
+    /// the given state vector, including entire delete set. Pending updates are not included.
+    /// - [TransactionMut::encode_update_v2] encodes only inserts and deletes made within the scope
+    /// of the current transaction.
     fn encode_diff_v2(&self, state_vector: &StateVector) -> Vec<u8> {
         let mut encoder = EncoderV2::new();
         self.encode_diff(state_vector, &mut encoder);
         encoder.to_vec()
     }
 
+    /// Encodes the difference between remote peer state given its `state_vector` and the state
+    /// of a current local peer. Also includes pending updates which were not yet integrated into
+    /// the main document state and entire delete set.
+    ///
+    /// # Differences between alternative methods
+    ///
+    /// - [Self::encode_state_as_update] encodes full document state including pending updates and
+    /// entire delete set.
+    /// - [Self::encode_diff] encodes only the difference between the current state and
+    /// the given state vector, including entire delete set. Pending updates are not included.
+    /// - [TransactionMut::encode_update] encodes only inserts and deletes made within the scope
+    /// of the current transaction.
     fn encode_state_as_update<E: Encoder>(&self, sv: &StateVector, encoder: &mut E) {
         let store = self.store();
         store.write_blocks_from(sv, encoder);
@@ -80,6 +123,18 @@ pub trait ReadTxn: Sized {
         ds.encode(encoder);
     }
 
+    /// Encodes the difference between remote peer state given its `state_vector` and the state
+    /// of a current local peer, using lib0 v1 encoding. Also includes pending updates which were
+    /// not yet integrated into the main document state and entire delete set.
+    ///
+    /// # Differences between alternative methods
+    ///
+    /// - [Self::encode_state_as_update_v1] encodes full document state including pending updates
+    /// and entire delete set.
+    /// - [Self::encode_diff_v1] encodes only the difference between the current state and
+    /// the given state vector, including entire delete set. Pending updates are not included.
+    /// - [TransactionMut::encode_update_v1] encodes only inserts and deletes made within the scope
+    /// of the current transaction.
     fn encode_state_as_update_v1(&self, sv: &StateVector) -> Vec<u8> {
         let mut encoder = EncoderV1::new();
         self.encode_state_as_update(sv, &mut encoder);
@@ -87,6 +142,18 @@ pub trait ReadTxn: Sized {
         merge_pending_v1(encoder.to_vec(), self.store())
     }
 
+    /// Encodes the difference between remote peer state given its `state_vector` and the state
+    /// of a current local peer, using lib0 v2 encoding. Also includes pending updates which were
+    /// not yet integrated into the main document state and entire delete set.
+    ///
+    /// # Differences between alternative methods
+    ///
+    /// - [Self::encode_state_as_update_v2] encodes full document state including pending updates
+    /// and entire delete set.
+    /// - [Self::encode_diff_v2] encodes only the difference between the current state and
+    /// the given state vector, including entire delete set. Pending updates are not included.
+    /// - [TransactionMut::encode_update_v2] encodes only inserts and deletes made within the scope
+    /// of the current transaction.
     fn encode_state_as_update_v2(&self, sv: &StateVector) -> Vec<u8> {
         let mut encoder = EncoderV2::new();
         self.encode_state_as_update(sv, &mut encoder);
@@ -211,6 +278,13 @@ pub trait ReadTxn: Sized {
             None
         }
     }
+
+    /// Returns `true` if current document has any pending updates that are not yet
+    /// integrated into the document.
+    fn has_missing_updates(&self) -> bool {
+        let store = self.store();
+        store.pending.is_some() || store.pending_ds.is_some()
+    }
 }
 
 pub trait WriteTxn: Sized {
@@ -274,6 +348,26 @@ pub trait WriteTxn: Sized {
     /// XML nodes).
     fn get_or_insert_xml_fragment<N: Into<Arc<str>>>(&mut self, name: N) -> XmlFragmentRef {
         XmlFragmentRef::root(name).get_or_create(self)
+    }
+
+    /// Prunes a pending updates from the current document and returns them.
+    /// Returns `None` if current document didn't have any pending updates.
+    fn prune_pending(&mut self) -> Option<Update> {
+        let mut merge = Vec::with_capacity(2);
+        let store = self.store_mut();
+        if let Some(pending) = store.pending.take() {
+            merge.push(pending.update);
+        }
+        if let Some(pending_ds) = store.pending_ds.take() {
+            let mut u = Update::new();
+            u.delete_set = pending_ds.clone();
+            merge.push(u);
+        }
+        if merge.is_empty() {
+            None
+        } else {
+            Some(Update::merge_updates(merge))
+        }
     }
 }
 
@@ -676,12 +770,6 @@ impl<'doc> TransactionMut<'doc> {
                 if let Some(linked_by) = self.store.linked_by.remove(&item) {
                     for link in linked_by {
                         self.add_changed_type(link, item.parent_sub.clone());
-                        #[cfg(feature = "weak")]
-                        if let crate::types::TypeRef::WeakLink(source) = &link.type_ref {
-                            if source.is_single() {
-                                source.first_item.take();
-                            }
-                        }
                     }
                 }
             }
@@ -1004,10 +1092,13 @@ impl<'doc> TransactionMut<'doc> {
     }
 
     /// Perform garbage collection of deleted blocks, even if a document was created with `skip_gc`
-    /// option. This operation will scan over ALL deleted elements, NOT ONLY the ones that have been
-    /// changed as part of this transaction scope.
-    pub fn force_gc(&mut self) {
-        GCCollector::collect_all(self);
+    /// option.
+    ///
+    /// If `delete_set` is provided, it will be used to limit the scope of garbage collection
+    /// to only those blocks that are present in the delete set. If `delete_set` is `None`, all
+    /// deleted blocks will be considered for garbage collection.
+    pub fn gc(&mut self, delete_set: Option<&DeleteSet>) {
+        GCCollector::collect_all(self, delete_set);
     }
 
     pub(crate) fn add_changed_type(&mut self, parent: BranchPtr, parent_sub: Option<Arc<str>>) {

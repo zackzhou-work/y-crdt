@@ -10,7 +10,7 @@ use crate::block::{
 };
 use crate::encoding::read::Error;
 use crate::error::UpdateError;
-use crate::id_set::DeleteSet;
+use crate::id_set::{DeleteSet, IdSet};
 use crate::slice::ItemSlice;
 #[cfg(test)]
 use crate::store::Store;
@@ -105,7 +105,8 @@ impl Update {
         Self::default()
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    /// Check if current update is empty.
+    pub fn is_empty(&self) -> bool {
         self.blocks.is_empty() && self.delete_set.is_empty()
     }
 
@@ -150,6 +151,45 @@ impl Update {
             }
         }
         sv
+    }
+
+    /// Returns a state vector representing a lower bound of items inserted by this update,
+    /// grouped by their respective clients.
+    pub fn state_vector_lower(&self) -> StateVector {
+        let mut sv = StateVector::default();
+        for (&client, blocks) in self.blocks.clients.iter() {
+            for block in blocks.iter() {
+                if !block.is_skip() {
+                    let id = block.id();
+                    sv.set_max(client, id.clock);
+                    break;
+                }
+            }
+        }
+        sv
+    }
+
+    /// Returns an insertion set associated with current update.
+    /// It contains ids of all blocks inserted by this update.
+    /// If `include_deleted` flag is set, result will include GC'ed blocks and ones that were
+    /// inserted but softly deleted.
+    pub fn insertions(&self, include_deleted: bool) -> IdSet {
+        let mut insertions = IdSet::default();
+        for blocks in self.blocks.clients.values() {
+            for block in blocks.iter() {
+                match block {
+                    BlockCarrier::Item(item) if include_deleted || !item.is_deleted() => {
+                        insertions.insert(item.id, item.len);
+                    }
+                    BlockCarrier::GC(range) if include_deleted => {
+                        insertions.insert(range.id, range.len);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        insertions.squash();
+        insertions
     }
 
     /// Returns a delete set associated with current update.
@@ -944,7 +984,7 @@ impl BlockCarrier {
             }
             BlockCarrier::Skip(x) => {
                 encoder.write_info(BLOCK_SKIP_REF_NUMBER);
-                encoder.write_len(x.len - offset);
+                encoder.write_var(x.len - offset);
             }
             BlockCarrier::GC(x) => {
                 encoder.write_info(BLOCK_GC_REF_NUMBER);
@@ -1121,18 +1161,19 @@ impl Iterator for IntoBlocks {
 
 #[cfg(test)]
 mod test {
+    use std::collections::{HashMap, VecDeque};
     use std::iter::FromIterator;
     use std::sync::{Arc, Mutex};
 
     use crate::block::{BlockRange, ClientID, Item, ItemContent};
     use crate::encoding::read::Cursor;
     use crate::types::{Delta, TypePtr};
-    use crate::update::{BlockCarrier, Update};
+    use crate::update::{BlockCarrier, Update, UpdateBlocks};
     use crate::updates::decoder::{Decode, DecoderV1};
     use crate::updates::encoder::Encode;
     use crate::{
-        Any, Doc, GetString, Options, ReadTxn, StateVector, Text, Transact, WriteTxn, XmlFragment,
-        XmlOut, ID,
+        merge_updates_v1, Any, DeleteSet, Doc, GetString, Options, ReadTxn, StateVector, Text,
+        Transact, WriteTxn, XmlFragment, XmlOut, ID,
     };
 
     #[test]
@@ -1448,16 +1489,85 @@ mod test {
 
     #[test]
     fn empty_update_v1() {
-        let mut u = Update::new();
+        let u = Update::new();
         let binary = u.encode_v1();
         assert_eq!(&binary, Update::EMPTY_V1)
     }
 
     #[test]
     fn empty_update_v2() {
-        let mut u = Update::new();
+        let u = Update::new();
         let binary = u.encode_v2();
         assert_eq!(&binary, Update::EMPTY_V2)
+    }
+
+    #[test]
+    fn update_v2_with_skips() {
+        let u1 = update_with_skips();
+        let encoded = u1.encode_v2();
+        let u2 = Update::decode_v2(&encoded).unwrap();
+        assert_eq!(u1, u2);
+    }
+
+    #[test]
+    fn pending_update_check() {
+        let update = update_with_skips();
+        let expected = update.encode_v1();
+        let doc = Doc::with_client_id(2);
+        let mut txn = doc.transact_mut();
+        let txt = txn.get_or_insert_text("test");
+        txn.apply_update(update).unwrap();
+        let str = txt.get_string(&txn);
+        assert_eq!(str, "hello"); // 'world' is missing because of skip block
+        assert!(txn.has_missing_updates());
+        let state = txn.encode_state_as_update_v1(&Default::default());
+        assert_eq!(state, expected); // we include pending update
+        let pending = txn.prune_pending();
+        assert!(pending.is_some());
+        let state = txn.encode_state_as_update_v1(&Default::default());
+        assert_ne!(state, expected); // we pruned pending update
+        let joined = merge_updates_v1([state, pending.unwrap().encode_v1()]).unwrap();
+        assert_eq!(joined, expected); // we joined current and pending state, they should be equal
+    }
+
+    fn update_with_skips() -> Update {
+        Update {
+            blocks: UpdateBlocks {
+                clients: HashMap::from_iter([(
+                    1,
+                    VecDeque::from_iter([
+                        BlockCarrier::Item(
+                            Item::new(
+                                ID::new(1, 0),
+                                None,
+                                None,
+                                None,
+                                None,
+                                TypePtr::Named("test".into()),
+                                None,
+                                ItemContent::String("hello".into()),
+                            )
+                            .unwrap(),
+                        ),
+                        BlockCarrier::Skip(BlockRange::new(ID::new(1, 5), 3)),
+                        BlockCarrier::Item(
+                            Item::new(
+                                ID::new(1, 8),
+                                None,
+                                Some(ID::new(1, 7)),
+                                None,
+                                None,
+                                TypePtr::Unknown,
+                                None,
+                                ItemContent::String("world".into()),
+                            )
+                            .unwrap(),
+                        ),
+                    ]),
+                )]),
+            },
+            delete_set: DeleteSet::default(),
+        }
     }
 
     fn test_item(client_id: ClientID, clock: u32, len: u32) -> BlockCarrier {

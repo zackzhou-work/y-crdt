@@ -437,6 +437,36 @@ impl StickyIndex {
         &self.scope
     }
 
+    /// Scope refers to root collection.
+    #[inline]
+    pub fn is_root(&self) -> bool {
+        if let IndexScope::Root(_) = &self.scope {
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Scope refers to nested shared collection.
+    #[inline]
+    pub fn is_nested(&self) -> bool {
+        if let IndexScope::Nested(_) = &self.scope {
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Scope refers to a position relative to another block.
+    #[inline]
+    pub fn is_relative(&self) -> bool {
+        if let IndexScope::Relative(_) = &self.scope {
+            true
+        } else {
+            false
+        }
+    }
+
     /// Returns an [ID] of the block position which is used as a reference to keep track the location
     /// of current [StickyIndex] even in face of changes performed by different peers.
     ///
@@ -604,6 +634,42 @@ impl StickyIndex {
             false
         } else {
             true
+        }
+    }
+
+    pub(crate) fn get_item<T: ReadTxn>(&self, txn: &T) -> Option<ItemPtr> {
+        let branch = match &self.scope {
+            IndexScope::Relative(id) => {
+                // position relative to existing block
+                let item = txn.store().blocks.get_item(id)?;
+                return if self.assoc == Assoc::After && &item.last_id() == id {
+                    item.right
+                } else {
+                    Some(item)
+                };
+            }
+            IndexScope::Nested(id) => {
+                // position at the beginning/end of a nested type
+                let item = txn.store().blocks.get_item(id)?;
+                item.as_branch()?
+            }
+            IndexScope::Root(name) => {
+                // position at the beginning/end of a root type
+                let branch = txn.store().types.get(name.as_ref())?;
+                BranchPtr::from(branch)
+            }
+        };
+        match &self.assoc {
+            // get first item of a branch
+            Assoc::Before => branch.start,
+            // get last item of a branch
+            Assoc::After => {
+                let mut item = branch.item?;
+                while let Some(right) = item.right {
+                    item = right;
+                }
+                Some(item)
+            }
         }
     }
 }
@@ -895,9 +961,9 @@ impl Decode for Assoc {
 pub trait IndexedSequence: AsRef<Branch> {
     /// Returns a [StickyIndex] equivalent to a human-readable `index`.
     /// Returns `None` if `index` is beyond the length of current sequence.
-    fn sticky_index(
+    fn sticky_index<T: ReadTxn>(
         &self,
-        txn: &mut TransactionMut,
+        txn: &T,
         index: u32,
         assoc: Assoc,
     ) -> Option<StickyIndex> {

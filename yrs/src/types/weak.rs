@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::atomic::AtomicRef;
 use crate::block::{EmbedPrelim, ItemContent, ItemPtr, Prelim};
 use crate::iter::{
     AsIter, BlockIterator, BlockSliceIterator, IntoBlockIter, MoveIter, RangeIter, TxnIterator,
@@ -15,8 +14,8 @@ use crate::iter::{
 };
 use crate::types::{AsPrelim, Branch, BranchPtr, Out, Path, SharedRef, TypeRef};
 use crate::{
-    Array, Assoc, DeepObservable, GetString, In, Map, Observable, ReadTxn, StickyIndex, TextRef,
-    TransactionMut, XmlTextRef, ID,
+    Array, Assoc, BranchID, DeepObservable, GetString, In, IndexScope, Map, Observable, ReadTxn,
+    StickyIndex, TextRef, TransactionMut, XmlTextRef, ID,
 };
 
 /// Weak link reference represents a reference to a single element or consecutive range of elements
@@ -283,9 +282,10 @@ where
     /// map.insert(&mut txn, "A", "other");
     /// assert_eq!(link.try_deref_value(&txn), Some("other".into()));
     /// ```
-    pub fn try_deref_value<T: ReadTxn>(&self, _txn: &T) -> Option<Out> {
+    pub fn try_deref_value<T: ReadTxn>(&self, txn: &T) -> Option<Out> {
         let source = self.try_source()?;
-        let last = source.first_item.get_owned().to_iter().last()?;
+        let item = source.quote_start.get_item(txn);
+        let last = item.to_iter().last()?;
         if last.is_deleted() {
             None
         } else {
@@ -299,7 +299,7 @@ where
     P: SharedRef + Array,
 {
     /// Returns an iterator over [Out]s existing in a scope of the current [WeakRef] quotation
-    /// range.  
+    /// range.
     pub fn unquote<'a, T: ReadTxn>(&self, txn: &'a T) -> Unquote<'a, T> {
         if let Some(source) = self.try_source() {
             source.unquote(txn)
@@ -361,7 +361,7 @@ where
     P: SharedRef + Array,
 {
     /// Returns an iterator over [Out]s existing in a scope of the current [WeakPrelim] quotation
-    /// range.  
+    /// range.
     pub fn unquote<'a, T: ReadTxn>(&self, txn: &'a T) -> Unquote<'a, T> {
         self.source.unquote(txn)
     }
@@ -487,7 +487,6 @@ impl WeakEvent {
 pub struct LinkSource {
     pub(crate) quote_start: StickyIndex,
     pub(crate) quote_end: StickyIndex,
-    pub(crate) first_item: AtomicRef<ItemPtr>,
 }
 
 impl LinkSource {
@@ -495,20 +494,21 @@ impl LinkSource {
         LinkSource {
             quote_start: start,
             quote_end: end,
-            first_item: AtomicRef::default(),
         }
     }
 
+    #[inline]
     pub fn is_single(&self) -> bool {
-        match (self.quote_start.id(), self.quote_end.id()) {
-            (Some(x), Some(y)) => x == y,
+        match (self.quote_start.scope(), self.quote_end.scope()) {
+            (IndexScope::Relative(x), IndexScope::Relative(y)) => x == y,
             _ => false,
         }
     }
 
     /// Remove reference to current weak link from all items it quotes.
     pub(crate) fn unlink_all(&self, txn: &mut TransactionMut, branch_ptr: BranchPtr) {
-        let mut i = self.first_item.take().map(|arc| *arc).to_iter().moved();
+        let item = self.quote_start.get_item(txn);
+        let mut i = item.to_iter().moved();
         while let Some(item) = i.next(txn) {
             if item.info.is_linked() {
                 txn.unlink(item, branch_ptr);
@@ -517,10 +517,9 @@ impl LinkSource {
     }
 
     pub(crate) fn unquote<'a, T: ReadTxn>(&self, txn: &'a T) -> Unquote<'a, T> {
-        let mut current = self.first_item.get_owned();
+        let mut current = self.quote_start.get_item(txn);
         if let Some(ptr) = &mut current {
             if Self::try_right_most(ptr) {
-                self.first_item.swap(*ptr);
                 current = Some(*ptr);
             }
         }
@@ -551,25 +550,15 @@ impl LinkSource {
     }
 
     pub(crate) fn materialize(&self, txn: &mut TransactionMut, inner_ref: BranchPtr) {
-        let curr = if let Some(ptr) = self.first_item.get_owned() {
+        let curr = if let Some(ptr) = self.quote_start.get_item(txn) {
             ptr
         } else {
-            if let Some(ptr) = self
-                .quote_start
-                .id()
-                .and_then(|id| txn.store.blocks.get_item(id))
-            {
-                self.first_item.swap(ptr);
-                ptr
-            } else {
-                // referenced element has already been GCed
-                return;
-            }
+            // referenced element has already been GCed
+            return;
         };
         if curr.parent_sub.is_some() {
             // for maps, advance to most recent item
             if let Some(mut last) = Some(curr).to_iter().last() {
-                self.first_item.swap(last);
                 last.info.set_linked();
                 let linked_by = txn.store.linked_by.entry(last).or_default();
                 linked_by.insert(inner_ref);
@@ -586,7 +575,6 @@ impl LinkSource {
                     slice.ptr
                 };
                 if first {
-                    self.first_item.swap(item);
                     first = false;
                 }
                 item.info.set_linked();
@@ -596,31 +584,35 @@ impl LinkSource {
         }
     }
 
-    pub fn to_string<T: ReadTxn>(&self, _txn: &T) -> String {
+    pub fn to_string<T: ReadTxn>(&self, txn: &T) -> String {
         let mut result = String::new();
-        let mut curr = self.first_item.get_owned();
-        let end = self.quote_end.id().unwrap();
+        let mut curr = self.quote_start.get_item(txn);
+        let end = self.quote_end.id();
         while let Some(item) = curr.as_deref() {
-            if self.quote_end.assoc == Assoc::Before && &item.id == end {
-                // right side is open (last item excluded)
-                break;
+            if let Some(end) = end {
+                if self.quote_end.assoc == Assoc::Before && &item.id == end {
+                    // right side is open (last item excluded)
+                    break;
+                }
             }
             if !item.is_deleted() {
                 if let ItemContent::String(s) = &item.content {
                     result.push_str(s.as_str());
                 }
             }
-            if self.quote_end.assoc == Assoc::After && &item.last_id() == end {
-                // right side is closed (last item included)
-                break;
+            if let Some(end) = end {
+                if self.quote_end.assoc == Assoc::After && &item.last_id() == end {
+                    // right side is closed (last item included)
+                    break;
+                }
             }
             curr = item.right;
         }
         result
     }
 
-    pub fn to_xml_string<T: ReadTxn>(&self, _txn: &T) -> String {
-        let curr = self.first_item.get_owned();
+    pub fn to_xml_string<T: ReadTxn>(&self, txn: &T) -> String {
+        let curr = self.quote_start.get_item(txn);
         if let Some(item) = curr.as_deref() {
             if let Some(branch) = item.parent.as_branch() {
                 return XmlTextRef::get_string_fragment(
@@ -705,71 +697,86 @@ pub trait Quotable: AsRef<Branch> + Sized {
         R: RangeBounds<u32>,
     {
         let this = BranchPtr::from(self.as_ref());
-        let (start, assoc_start) = match range.start_bound() {
-            Bound::Included(&i) => (i, Assoc::Before),
-            Bound::Excluded(&i) => (i, Assoc::After),
-            Bound::Unbounded => return Err(QuoteError::UnboundedRange),
+        let start = match range.start_bound() {
+            Bound::Included(&i) => Some((i, Assoc::Before)),
+            Bound::Excluded(&i) => Some((i, Assoc::After)),
+            Bound::Unbounded => None,
         };
-        let (end, assoc_end) = match range.end_bound() {
-            Bound::Included(&i) => (i, Assoc::After),
-            Bound::Excluded(&i) => (i, Assoc::Before),
-            Bound::Unbounded => return Err(QuoteError::UnboundedRange),
+        let end = match range.end_bound() {
+            Bound::Included(&i) => Some((i, Assoc::After)),
+            Bound::Excluded(&i) => Some((i, Assoc::Before)),
+            Bound::Unbounded => None,
         };
-        let mut remaining = start;
         let encoding = txn.store().offset_kind;
+        let mut start_index = 0;
+        let mut remaining = start_index;
+        let mut curr = None;
         let mut i = this.start.to_iter().moved();
-        // figure out the first ID
-        let mut curr = i.next(txn);
-        while let Some(item) = curr.as_deref() {
-            if remaining == 0 {
-                break;
-            }
-            if !item.is_deleted() && item.is_countable() {
-                let len = item.content_len(encoding);
-                if remaining < len {
+
+        let start = if let Some((start_i, assoc_start)) = start {
+            start_index = start_i;
+            remaining = start_index;
+            // figure out the first ID
+            curr = i.next(txn);
+            while let Some(item) = curr.as_deref() {
+                if remaining == 0 {
                     break;
                 }
-                remaining -= len;
-            }
-            curr = i.next(txn);
-        }
-        let start_id = if let Some(item) = curr.as_deref() {
-            let mut id = item.id.clone();
-            id.clock += if let ItemContent::String(s) = &item.content {
-                s.block_offset(remaining, encoding)
-            } else {
-                remaining
-            };
-            id
-        } else {
-            return Err(QuoteError::OutOfBounds);
-        };
-        // figure out the last ID
-        remaining = end - start + remaining;
-        while let Some(item) = curr.as_deref() {
-            if !item.is_deleted() && item.is_countable() {
-                let len = item.content_len(encoding);
-                if remaining < len {
-                    break;
+                if !item.is_deleted() && item.is_countable() {
+                    let len = item.content_len(encoding);
+                    if remaining < len {
+                        break;
+                    }
+                    remaining -= len;
                 }
-                remaining -= len;
+                curr = i.next(txn);
             }
-            curr = i.next(txn);
-        }
-        let end_id = if let Some(item) = curr.as_deref() {
-            let mut id = item.id.clone();
-            id.clock += if let ItemContent::String(s) = &item.content {
-                s.block_offset(remaining, encoding)
+            let start_id = if let Some(item) = curr.as_deref() {
+                let mut id = item.id.clone();
+                id.clock += if let ItemContent::String(s) = &item.content {
+                    s.block_offset(remaining, encoding)
+                } else {
+                    remaining
+                };
+                id
             } else {
-                remaining
+                return Err(QuoteError::OutOfBounds);
             };
-            id
+            StickyIndex::new(IndexScope::Relative(start_id), assoc_start)
         } else {
-            return Err(QuoteError::OutOfBounds);
+            curr = i.next(txn);
+            StickyIndex::new(IndexScope::from_branch(this), Assoc::Before)
         };
 
-        let start = StickyIndex::from_id(start_id, assoc_start);
-        let end = StickyIndex::from_id(end_id, assoc_end);
+        let end = if let Some((end_index, assoc_end)) = end {
+            // figure out the last ID
+            remaining = end_index - start_index + remaining;
+            while let Some(item) = curr.as_deref() {
+                if !item.is_deleted() && item.is_countable() {
+                    let len = item.content_len(encoding);
+                    if remaining < len {
+                        break;
+                    }
+                    remaining -= len;
+                }
+                curr = i.next(txn);
+            }
+            let end_id = if let Some(item) = curr.as_deref() {
+                let mut id = item.id.clone();
+                id.clock += if let ItemContent::String(s) = &item.content {
+                    s.block_offset(remaining, encoding)
+                } else {
+                    remaining
+                };
+                id
+            } else {
+                return Err(QuoteError::OutOfBounds);
+            };
+            StickyIndex::new(IndexScope::Relative(end_id), assoc_end)
+        } else {
+            StickyIndex::new(IndexScope::from_branch(this), Assoc::After)
+        };
+
         let source = LinkSource::new(start, end);
         Ok(WeakPrelim::with_source(Arc::new(source)))
     }
@@ -786,10 +793,6 @@ pub enum QuoteError {
     /// of reference.
     #[error("Quoted range spans beyond the bounds of current collection")]
     OutOfBounds,
-    /// Range param passed to [Quotable::quote] contains an unbounded end (ie. `..n` or `n..`),
-    /// which is not supported at the moment.
-    #[error("Quotations don't support unbounded ranges")]
-    UnboundedRange,
 }
 
 pub(crate) fn join_linked_range(mut block: ItemPtr, txn: &mut TransactionMut) {
@@ -839,7 +842,6 @@ pub(crate) fn join_linked_range(mut block: ItemPtr, txn: &mut TransactionMut) {
                                 // even though current boundary if left-side exclusive, current item
                                 // has been inserted on the right of it, therefore it's within range
                                 common.insert(*link);
-                                source.first_item.swap(block_copy); // this item is the new most left-wise
                             }
                         }
                     }
@@ -877,7 +879,7 @@ mod test {
     use crate::Assoc::{After, Before};
     use crate::{
         Array, ArrayRef, DeepObservable, Doc, GetString, Map, MapPrelim, MapRef, Observable,
-        Quotable, Text, TextRef, Transact, XmlTextRef,
+        Quotable, ReadTxn, Text, TextRef, Transact, WriteTxn, XmlTextRef,
     };
 
     #[test]
@@ -1114,8 +1116,8 @@ mod test {
         assert_eq!(l1.get(&d1.transact(), "a2"), l2.get(&d2.transact(), "a2"));
     }
 
-    #[ignore]
     #[test]
+    #[cfg_attr(target_os = "windows", ignore)]
     fn delete_weak_link() {
         let d1 = Doc::new();
         let m1 = d1.get_or_insert_map("map");
@@ -2079,16 +2081,16 @@ mod test {
         let txt1 = d1.get_or_insert_text("text");
         {
             let mut txn = d1.transact_mut();
-            txt1.insert(&mut txn, 0, "abcdef");
+            txt1.insert(&mut txn, 0, "abcdef"); // t1: 'abcdef'
         }
 
         let d2 = Doc::with_client_id(2);
         let _arr2 = d2.get_or_insert_array("array");
         let txt2 = d2.get_or_insert_text("text");
 
-        exchange_updates(&[&d1, &d2]);
+        exchange_updates(&[&d1, &d2]); // t2: 'abcdef'
 
-        txt2.insert(&mut d2.transact_mut(), 1, "xyz");
+        txt2.insert(&mut d2.transact_mut(), 1, "xyz"); // t2: 'axyzbcdef'
 
         let link_excl = {
             struct RangeLeftExclusive(u32, u32);
@@ -2103,12 +2105,12 @@ mod test {
             }
 
             let mut txn = d1.transact_mut();
-            let q = txt1.quote(&txn, RangeLeftExclusive(0, 5)).unwrap();
+            let q = txt1.quote(&txn, RangeLeftExclusive(0, 5)).unwrap(); // [bcde]
             arr1.insert(&mut txn, 0, q)
         };
         let link_incl = {
             let mut txn = d1.transact_mut();
-            let q = txt1.quote(&txn, 1..5).unwrap();
+            let q = txt1.quote(&txn, 1..5).unwrap(); // [bcde]
             arr1.insert(&mut txn, 0, q)
         };
         {
@@ -2192,5 +2194,108 @@ mod test {
             let str = to_weak_xml_text(&link_incl).get_string(&txn);
             assert_eq!(&str, "bcde");
         }
+    }
+
+    #[test]
+    fn quote_end_unbounded_text() {
+        let d1 = Doc::with_client_id(1);
+        let mut txn = d1.transact_mut();
+        let txt1 = txn.get_or_insert_text("text");
+        let arr1 = txn.get_or_insert_array("array");
+        txt1.insert(&mut txn, 0, "abc");
+        let link1 = txt1.quote(&txn, 1..).unwrap();
+        let link1 = arr1.insert(&mut txn, 0, link1);
+        let str = link1.get_string(&txn);
+        assert_eq!(str, "bc");
+
+        txt1.push(&mut txn, "def");
+        let str = link1.get_string(&txn);
+        assert_eq!(str, "bcdef");
+        drop(txn);
+
+        let d2 = Doc::with_client_id(2);
+
+        exchange_updates(&[&d1, &d2]);
+
+        let mut txn = d2.transact_mut();
+        let txt2 = txn.get_or_insert_text("text");
+        let arr2 = txn.get_or_insert_array("array");
+
+        let link2 = arr2
+            .get(&txn, 0)
+            .unwrap()
+            .cast::<WeakRef<TextRef>>()
+            .unwrap();
+        let str = link2.get_string(&txn);
+        assert_eq!(str, "bcdef");
+    }
+
+    #[test]
+    fn quote_start_unbounded_text() {
+        let d1 = Doc::with_client_id(1);
+        let mut txn = d1.transact_mut();
+        let txt1 = txn.get_or_insert_text("text");
+        let arr1 = txn.get_or_insert_array("array");
+        txt1.insert(&mut txn, 0, "xyz");
+        let link1 = txt1.quote(&txn, ..=1).unwrap();
+        let link1 = arr1.insert(&mut txn, 0, link1);
+        let str = link1.get_string(&txn);
+        assert_eq!(str, "xy");
+
+        txt1.insert(&mut txn, 0, "uwv"); // 'uwvxyz'
+        let str = link1.get_string(&txn);
+        assert_eq!(str, "uwvxy");
+        drop(txn);
+
+        let d2 = Doc::with_client_id(2);
+
+        exchange_updates(&[&d1, &d2]);
+
+        let mut txn = d2.transact_mut();
+        let _txt2 = txn.get_or_insert_text("text");
+        let arr2 = txn.get_or_insert_array("array");
+
+        let link2 = arr2
+            .get(&txn, 0)
+            .unwrap()
+            .cast::<WeakRef<TextRef>>()
+            .unwrap();
+        let str = link2.get_string(&txn);
+        assert_eq!(str, "uwvxy");
+    }
+
+    #[test]
+    fn quote_both_sides_unbounded_text() {
+        let d1 = Doc::with_client_id(1);
+        let mut txn = d1.transact_mut();
+        let txt1 = txn.get_or_insert_text("text");
+        let arr1 = txn.get_or_insert_array("array");
+        txt1.insert(&mut txn, 0, "xyz");
+        let link1 = txt1.quote(&txn, ..).unwrap();
+        let link1 = arr1.insert(&mut txn, 0, link1);
+        let str = link1.get_string(&txn);
+        assert_eq!(str, "xyz");
+
+        txt1.insert(&mut txn, 0, "uwv"); // 'uwvxyz'
+        txt1.push(&mut txn, "abc"); // 'uwvxyzabc'
+        let str = link1.get_string(&txn);
+        assert_eq!(str, "uwvxyzabc");
+        drop(txn);
+
+        let d2 = Doc::with_client_id(2);
+
+        exchange_updates(&[&d1, &d2]);
+
+        let mut txn = d2.transact_mut();
+        let txt2 = txn.get_or_insert_text("text");
+        let arr2 = txn.get_or_insert_array("array");
+
+        let link2 = arr2
+            .get(&txn, 0)
+            .unwrap()
+            .cast::<WeakRef<TextRef>>()
+            .unwrap();
+        let str = link2.get_string(&txn);
+        assert_eq!(str, "uwvxyzabc");
     }
 }

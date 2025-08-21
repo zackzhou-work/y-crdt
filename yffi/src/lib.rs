@@ -246,7 +246,7 @@ impl Drop for YMapEntry {
 #[repr(C)]
 pub struct YXmlAttr {
     pub name: *const c_char,
-    pub value: *const c_char,
+    pub value: *const YOutput,
 }
 
 impl Drop for YXmlAttr {
@@ -683,7 +683,7 @@ pub unsafe extern "C" fn ytransaction_force_gc(txn: *mut Transaction) {
     assert!(!txn.is_null());
     let txn = txn.as_mut().unwrap();
     let txn = txn.as_mut().unwrap();
-    txn.force_gc();
+    txn.gc(None);
 }
 
 /// Returns `1` if current transaction is of read-write type.
@@ -1960,7 +1960,7 @@ pub unsafe extern "C" fn yxmlelem_insert_attr(
     xml: *const Branch,
     txn: *mut Transaction,
     attr_name: *const c_char,
-    attr_value: *const c_char,
+    attr_value: *const YInput,
 ) {
     assert!(!xml.is_null());
     assert!(!txn.is_null());
@@ -1974,9 +1974,8 @@ pub unsafe extern "C" fn yxmlelem_insert_attr(
         .expect("provided transaction was not writeable");
 
     let key = CStr::from_ptr(attr_name).to_str().unwrap();
-    let value = CStr::from_ptr(attr_value).to_str().unwrap();
 
-    xml.insert_attribute(txn, key, value);
+    xml.insert_attribute(txn, key, attr_value.read());
 }
 
 /// Removes an attribute from a current `YXmlElement`, given its name.
@@ -2012,7 +2011,7 @@ pub unsafe extern "C" fn yxmlelem_get_attr(
     xml: *const Branch,
     txn: *const Transaction,
     attr_name: *const c_char,
-) -> *mut c_char {
+) -> *mut YOutput {
     assert!(!xml.is_null());
     assert!(!attr_name.is_null());
     assert!(!txn.is_null());
@@ -2022,7 +2021,8 @@ pub unsafe extern "C" fn yxmlelem_get_attr(
     let key = CStr::from_ptr(attr_name).to_str().unwrap();
     let txn = txn.as_ref().unwrap();
     if let Some(value) = xml.get_attribute(txn, key) {
-        CString::new(value).unwrap().into_raw()
+        let output = YOutput::from(value);
+        Box::into_raw(Box::new(output))
     } else {
         std::ptr::null_mut()
     }
@@ -2085,7 +2085,7 @@ pub unsafe extern "C" fn yxmlattr_iter_next(iterator: *mut Attributes) -> *mut Y
     if let Some((name, value)) = iter.0.next() {
         Box::into_raw(Box::new(YXmlAttr {
             name: CString::new(name).unwrap().into_raw(),
-            value: CString::new(value).unwrap().into_raw(),
+            value: Box::into_raw(Box::new(YOutput::from(value))),
         }))
     } else {
         std::ptr::null_mut()
@@ -2525,7 +2525,7 @@ pub unsafe extern "C" fn yxmltext_insert_attr(
     txt: *const Branch,
     txn: *mut Transaction,
     attr_name: *const c_char,
-    attr_value: *const c_char,
+    attr_value: *const YInput,
 ) {
     assert!(!txt.is_null());
     assert!(!txn.is_null());
@@ -2539,9 +2539,8 @@ pub unsafe extern "C" fn yxmltext_insert_attr(
         .expect("provided transaction was not writeable");
 
     let name = CStr::from_ptr(attr_name).to_str().unwrap();
-    let value = CStr::from_ptr(attr_value).to_str().unwrap();
 
-    txt.insert_attribute(txn, name, value)
+    txt.insert_attribute(txn, name, attr_value.read());
 }
 
 /// Removes an attribute from a current `YXmlText`, given its name.
@@ -2577,7 +2576,7 @@ pub unsafe extern "C" fn yxmltext_get_attr(
     txt: *const Branch,
     txn: *const Transaction,
     attr_name: *const c_char,
-) -> *mut c_char {
+) -> *mut YOutput {
     assert!(!txt.is_null());
     assert!(!attr_name.is_null());
     assert!(!txn.is_null());
@@ -2587,7 +2586,8 @@ pub unsafe extern "C" fn yxmltext_get_attr(
     let name = CStr::from_ptr(attr_name).to_str().unwrap();
 
     if let Some(value) = txt.get_attribute(txn, name) {
-        CString::new(value).unwrap().into_raw()
+        let output = YOutput::from(value);
+        Box::into_raw(Box::new(output))
     } else {
         std::ptr::null_mut()
     }
@@ -5581,6 +5581,40 @@ pub unsafe extern "C" fn yweak_deref(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn yweak_read(
+    text_link: *const Branch,
+    txn: *const Transaction,
+    out_branch: *mut *mut Branch,
+    out_start_index: *mut u32,
+    out_end_index: *mut u32,
+) {
+    assert!(!text_link.is_null());
+    assert!(!txn.is_null());
+
+    let txn = txn.as_ref().unwrap();
+    let weak: WeakRef<BranchPtr> = WeakRef::from_raw_branch(text_link);
+    if let Some(id) = weak.start_id() {
+        // Assoc must be After to get the same values back
+        let start = StickyIndex::from_id(*id, Assoc::After);
+        assert!(weak.end_id() != None);
+        let end = StickyIndex::from_id(*weak.end_id().unwrap(), Assoc::After);
+        if let Some(start_pos) = start.get_offset(txn) {
+            *out_branch = start_pos.branch.as_ref() as *const Branch as *mut Branch;
+            *out_start_index = start_pos.index as u32;
+            if let Some(end_pos) = end.get_offset(txn) {
+                assert!(*out_branch == end_pos.branch.as_ref() as *const Branch as *mut Branch);
+                *out_end_index = end_pos.index as u32;
+            }
+        }
+    } else {
+        assert!(weak.end_id() == None); // both
+                                        // unforunately no Branch in this case?
+        *out_start_index = 0; // empty text
+        *out_end_index = 0; // empty text
+    }
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn yweak_iter(
     array_link: *const Branch,
     txn: *const Transaction,
@@ -5687,8 +5721,8 @@ pub unsafe extern "C" fn ymap_link(
 pub unsafe extern "C" fn ytext_quote(
     text: *const Branch,
     txn: *mut Transaction,
-    start_index: u32,
-    end_index: u32,
+    start_index: *mut u32,
+    end_index: *mut u32,
     start_exclusive: i8,
     end_exclusive: i8,
 ) -> *const Weak {
@@ -5701,6 +5735,8 @@ pub unsafe extern "C" fn ytext_quote(
         .as_mut()
         .expect("provided transaction was not writeable");
 
+    let start_index = start_index.as_ref().cloned();
+    let end_index = end_index.as_ref().cloned();
     let range = ExplicitRange {
         start_index,
         end_index,
@@ -5719,8 +5755,8 @@ pub unsafe extern "C" fn ytext_quote(
 pub unsafe extern "C" fn yarray_quote(
     array: *const Branch,
     txn: *mut Transaction,
-    start_index: u32,
-    end_index: u32,
+    start_index: *mut u32,
+    end_index: *mut u32,
     start_exclusive: i8,
     end_exclusive: i8,
 ) -> *const Weak {
@@ -5733,6 +5769,8 @@ pub unsafe extern "C" fn yarray_quote(
         .as_mut()
         .expect("provided transaction was not writeable");
 
+    let start_index = start_index.as_ref().cloned();
+    let end_index = end_index.as_ref().cloned();
     let range = ExplicitRange {
         start_index,
         end_index,
@@ -5748,26 +5786,26 @@ pub unsafe extern "C" fn yarray_quote(
 }
 
 struct ExplicitRange {
-    start_index: u32,
-    end_index: u32,
+    start_index: Option<u32>,
+    end_index: Option<u32>,
     start_exclusive: i8,
     end_exclusive: i8,
 }
 
 impl RangeBounds<u32> for ExplicitRange {
     fn start_bound(&self) -> Bound<&u32> {
-        if self.start_exclusive == 0 {
-            Bound::Included(&self.start_index)
-        } else {
-            Bound::Excluded(&self.start_index)
+        match (&self.start_index, self.start_exclusive) {
+            (None, _) => Bound::Unbounded,
+            (Some(i), 0) => Bound::Included(i),
+            (Some(i), _) => Bound::Excluded(i),
         }
     }
 
     fn end_bound(&self) -> Bound<&u32> {
-        if self.end_exclusive == 0 {
-            Bound::Included(&self.end_index)
-        } else {
-            Bound::Excluded(&self.end_index)
+        match (&self.end_index, self.end_exclusive) {
+            (None, _) => Bound::Unbounded,
+            (Some(i), 0) => Bound::Included(i),
+            (Some(i), _) => Bound::Excluded(i),
         }
     }
 }

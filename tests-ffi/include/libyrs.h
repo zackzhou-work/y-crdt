@@ -476,7 +476,7 @@ typedef struct YMapEntry {
  */
 typedef struct YXmlAttr {
   const char *name;
-  const char *value;
+  const struct YOutput *value;
 } YXmlAttr;
 
 /**
@@ -1799,7 +1799,7 @@ char *yxmlelem_string(const Branch *xml, const YTransaction *txn);
 void yxmlelem_insert_attr(const Branch *xml,
                           YTransaction *txn,
                           const char *attr_name,
-                          const char *attr_value);
+                          const struct YInput *attr_value);
 
 /**
  * Removes an attribute from a current `YXmlElement`, given its name.
@@ -1815,7 +1815,9 @@ void yxmlelem_remove_attr(const Branch *xml, YTransaction *txn, const char *attr
  *
  * An `attr_name` must be a null-terminated UTF-8 encoded string.
  */
-char *yxmlelem_get_attr(const Branch *xml, const YTransaction *txn, const char *attr_name);
+struct YOutput *yxmlelem_get_attr(const Branch *xml,
+                                  const YTransaction *txn,
+                                  const char *attr_name);
 
 /**
  * Returns an iterator over the `YXmlElement` attributes.
@@ -2031,7 +2033,7 @@ void yxmltext_remove_range(const Branch *txt, YTransaction *txn, uint32_t idx, u
 void yxmltext_insert_attr(const Branch *txt,
                           YTransaction *txn,
                           const char *attr_name,
-                          const char *attr_value);
+                          const struct YInput *attr_value);
 
 /**
  * Removes an attribute from a current `YXmlText`, given its name.
@@ -2047,7 +2049,9 @@ void yxmltext_remove_attr(const Branch *txt, YTransaction *txn, const char *attr
  *
  * An `attr_name` must be a null-terminated UTF-8 encoded string.
  */
-char *yxmltext_get_attr(const Branch *txt, const YTransaction *txn, const char *attr_name);
+struct YOutput *yxmltext_get_attr(const Branch *txt,
+                                  const YTransaction *txn,
+                                  const char *attr_name);
 
 /**
  * Returns a collection of chunks representing pieces of `YText` rich text string grouped together
@@ -2736,6 +2740,12 @@ void yweak_destroy(const Weak *weak);
 
 struct YOutput *yweak_deref(const Branch *map_link, const YTransaction *txn);
 
+void yweak_read(const Branch *text_link,
+                const YTransaction *txn,
+                Branch **out_branch,
+                uint32_t *out_start_index,
+                uint32_t *out_end_index);
+
 YWeakIter *yweak_iter(const Branch *array_link, const YTransaction *txn);
 
 void yweak_iter_destroy(YWeakIter *iter);
@@ -2760,15 +2770,15 @@ const Weak *ymap_link(const Branch *map, const YTransaction *txn, const char *ke
 
 const Weak *ytext_quote(const Branch *text,
                         YTransaction *txn,
-                        uint32_t start_index,
-                        uint32_t end_index,
+                        uint32_t *start_index,
+                        uint32_t *end_index,
                         int8_t start_exclusive,
                         int8_t end_exclusive);
 
 const Weak *yarray_quote(const Branch *array,
                          YTransaction *txn,
-                         uint32_t start_index,
-                         uint32_t end_index,
+                         uint32_t *start_index,
+                         uint32_t *end_index,
                          int8_t start_exclusive,
                          int8_t end_exclusive);
 
